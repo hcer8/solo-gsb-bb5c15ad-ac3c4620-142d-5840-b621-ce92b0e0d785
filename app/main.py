@@ -1,17 +1,20 @@
 """租约协调服务：多工作进程间的独占任务协调。
 
 所有租约状态转换均由 Redis Lua 脚本原子完成（见 app/lua.py），
-过期判断基于 Redis 服务器时间（TIME 命令）。
+过期判断基于 Redis 服务器时间（TIME 命令）；申请 / 批量申请 / 续租 /
+释放的审计事件与状态转换在同一 Lua 脚本内写入按任务键分组的
+Redis Stream（事件时间即脚本内同一次 TIME）。
 """
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -31,6 +34,8 @@ from .schemas import (
     AcquiredLease,
     AcquireRequest,
     AcquireResponse,
+    LeaseEvent,
+    LeaseEventsResponse,
     LeaseStateResponse,
     LimitCheckRequest,
     LimitCheckResponse,
@@ -63,7 +68,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
         "原子滑动窗口成本限流（FastAPI + Redis Lua）"
@@ -99,6 +104,10 @@ def lease_key(settings: Settings, task_key: str) -> str:
 
 def fencing_key(settings: Settings, task_key: str) -> str:
     return f"{settings.key_prefix}:fencing:{task_key}"
+
+
+def events_key(settings: Settings, task_key: str) -> str:
+    return f"{settings.key_prefix}:events:{task_key}"
 
 
 def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
@@ -164,8 +173,12 @@ async def acquire(
     ttl = resolve_ttl(req.ttl_ms, settings)
     token = uuid.uuid4().hex
     ok, fencing, expires_at = await scripts.acquire(
-        keys=[lease_key(settings, req.task_key), fencing_key(settings, req.task_key)],
-        args=[token, ttl],
+        keys=[
+            lease_key(settings, req.task_key),
+            fencing_key(settings, req.task_key),
+            events_key(settings, req.task_key),
+        ],
+        args=[token, ttl, settings.audit_max_events],
     )
     if ok:
         return AcquireResponse(
@@ -206,10 +219,16 @@ async def acquire_batch(
     tokens = [uuid.uuid4().hex for _ in req.task_keys]
     lease_keys = [lease_key(settings, k) for k in req.task_keys]
     fencer_keys = [fencing_key(settings, k) for k in req.task_keys]
+    stream_keys = [events_key(settings, k) for k in req.task_keys]
 
     result = await scripts.acquire_batch(
-        keys=lease_keys + fencer_keys,
-        args=[str(len(req.task_keys)), *tokens, str(ttl)],
+        keys=lease_keys + fencer_keys + stream_keys,
+        args=[
+            str(len(req.task_keys)),
+            *tokens,
+            str(ttl),
+            str(settings.audit_max_events),
+        ],
     )
 
     if result[0]:
@@ -244,8 +263,13 @@ async def renew(
     """
     ttl = resolve_ttl(req.ttl_ms, settings)
     ok, reason, expires_at = await scripts.renew(
-        keys=[lease_key(settings, req.task_key)],
-        args=[req.token, str(req.fencing_token), ttl],
+        keys=[lease_key(settings, req.task_key), events_key(settings, req.task_key)],
+        args=[
+            req.token,
+            str(req.fencing_token),
+            ttl,
+            str(settings.audit_max_events),
+        ],
     )
     if ok:
         return RenewResponse(renewed=True, expires_at_ms=expires_at)
@@ -262,8 +286,12 @@ async def release(
     旧持有者在超时后调用本接口不会影响新租约。
     """
     released = await scripts.release(
-        keys=[lease_key(settings, req.task_key)],
-        args=[req.token, str(req.fencing_token)],
+        keys=[lease_key(settings, req.task_key), events_key(settings, req.task_key)],
+        args=[
+            req.token,
+            str(req.fencing_token),
+            str(settings.audit_max_events),
+        ],
     )
     return ReleaseResponse(released=bool(released))
 
@@ -278,6 +306,76 @@ async def validate(
         args=[req.token, str(req.fencing_token)],
     )
     return ValidateResponse(valid=bool(valid), remaining_ms=remaining_ms)
+
+
+# Redis Stream ID 形如 "<毫秒时间戳>-<序号>"
+STREAM_ID_RE = re.compile(r"^\d+-\d+$")
+
+
+def parse_event(event_id: str, fields: dict) -> LeaseEvent:
+    fencing = fields.get("fencing")
+    return LeaseEvent(
+        id=event_id,
+        action=fields["action"],
+        result=fields["result"],
+        fencing_token=int(fencing) if fencing not in (None, "") else None,
+        time_ms=int(fields["time"]),
+    )
+
+
+@app.get(
+    "/v1/leases/{task_key:path}/events",
+    response_model=LeaseEventsResponse,
+)
+async def lease_events(
+    task_key: str,
+    redis: RedisDep,
+    settings: SettingsDep,
+    cursor: str | None = Query(
+        default=None,
+        description="分页游标（上一页返回的 next_cursor），不传则从最旧事件开始",
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="本页最多返回的事件条数（1～200）",
+    ),
+) -> LeaseEventsResponse:
+    """查看任务键的租约审计事件（按时间从旧到新分页）。
+
+    事件覆盖每次申请 / 批量申请 / 续租 / 释放（含成功与失败结果），
+    事件内 `fencing_token` 为事件发生时该任务键的防栅序号，
+    `time_ms` 为 Redis 服务器时间，与租约状态转换同源。
+
+    - `cursor`：上一页响应的 `next_cursor`（独占，即不会重复返回游标对应事件）；
+      不传则从最旧事件开始。游标格式非法时返回 400。
+    - `limit`：本页条数上限；实际多取 1 条用于判断是否还有下一页，
+      有则返回 `next_cursor`（本页最后一条事件 ID），无则为 `null`。
+    """
+    if cursor is not None:
+        cursor = cursor.strip()
+        if not STREAM_ID_RE.fullmatch(cursor):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="invalid cursor: expected a Redis stream id '<ms>-<seq>'",
+            )
+        # 独占游标：XRANGE 的 "(" 前缀排除该 ID 本身
+        min_id = f"({cursor}"
+    else:
+        min_id = "-"
+
+    # 多取 1 条用于判断是否存在下一页
+    rows = await redis.xrange(
+        events_key(settings, task_key), min=min_id, max="+", count=limit + 1
+    )
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    events = [parse_event(event_id, fields) for event_id, fields in page]
+    next_cursor = page[-1][0] if has_more and page else None
+    return LeaseEventsResponse(
+        task_key=task_key, events=events, next_cursor=next_cursor
+    )
 
 
 @app.get("/v1/leases/{task_key:path}", response_model=LeaseStateResponse)

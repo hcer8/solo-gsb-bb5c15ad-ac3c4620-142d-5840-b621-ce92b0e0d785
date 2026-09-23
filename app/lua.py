@@ -9,6 +9,15 @@
 - 过期判断一律使用 redis.call('TIME')，即 Redis 服务器时间，
   避免各客户端时钟不一致导致的问题。
 
+租约审计约定：
+- 每个任务键对应一个审计 Stream（events key），申请 / 批量申请 / 续租 /
+  释放（无论成功还是失败）都在各自的租约脚本内 XADD 一条事件，
+  与状态转换同脚本原子完成，事件时间取脚本内同一次 redis.call('TIME')。
+- 事件字段：action（操作类型）、result（操作结果）、fencing（事件发生时
+  该任务键的防栅序号，从未有过租约时为空串）、time（Redis 服务器毫秒）。
+- XADD 带 MAXLEN（精确裁剪）保留最近 N 条，N 由 LEASE_AUDIT_MAX_EVENTS
+  配置；Stream ID 由 Redis 按其服务器时钟自动生成。
+
 限流约定：
 - 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
   member 形如 "<uuid>:<cost>"，cost 编码在 member 尾部，
@@ -21,17 +30,23 @@
 """
 
 # 申请租约：仅当租约不存在或已过期时成功。
-# KEYS[1] = 租约键, KEYS[2] = 防栅计数器键
-# ARGV[1] = 新令牌, ARGV[2] = ttl_ms
+# 无论成功 / 冲突都向审计 Stream 追加一条事件（MAXLEN 精确裁剪）。
+# KEYS[1] = 租约键, KEYS[2] = 防栅计数器键, KEYS[3] = 审计 Stream 键
+# ARGV[1] = 新令牌, ARGV[2] = ttl_ms, ARGV[3] = 审计保留条数
 # 返回 {是否成功(1/0), fencing, expires_at}
 ACQUIRE_LUA = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local ttl = tonumber(ARGV[2])
+local maxlen = tonumber(ARGV[3])
 
 local expires_at = redis.call('HGET', KEYS[1], 'expires_at')
 if expires_at and tonumber(expires_at) > now then
-  return {0, tonumber(redis.call('HGET', KEYS[1], 'fencing')), tonumber(expires_at)}
+  local fencing = tonumber(redis.call('HGET', KEYS[1], 'fencing'))
+  redis.call('XADD', KEYS[3], 'MAXLEN', maxlen, '*',
+    'action', 'acquire', 'result', 'conflict',
+    'fencing', fencing, 'time', now)
+  return {0, fencing, tonumber(expires_at)}
 end
 
 local fencing = redis.call('INCR', KEYS[2])
@@ -40,6 +55,9 @@ redis.call('HSET', KEYS[1],
   'fencing', fencing,
   'expires_at', now + ttl)
 redis.call('PEXPIRE', KEYS[1], ttl)
+redis.call('XADD', KEYS[3], 'MAXLEN', maxlen, '*',
+  'action', 'acquire', 'result', 'acquired',
+  'fencing', fencing, 'time', now)
 return {1, fencing, now + ttl}
 """
 
@@ -48,11 +66,16 @@ return {1, fencing, now + ttl}
 # 不创建任何租约、不递增任何防栅计数器；
 # 全部可用（不存在或已过期，过期可被接管）时再统一写入。
 # 全程只调用一次 TIME，所有成功租约的 expires_at 基于同一基准时刻。
+# 审计事件同样在本脚本内原子追加：
+#   冲突时仅为每个冲突键写一条 acquire_batch/conflict 事件；
+#   成功时为每个任务键写一条 acquire_batch/acquired 事件。
 # KEYS[1..n]    = 租约键
 # KEYS[n+1..2n] = 防栅计数器键（与租约键同序）
+# KEYS[2n+1..3n] = 审计 Stream 键（与租约键同序）
 # ARGV[1]       = 任务数 n
 # ARGV[2..n+1]  = 各任务的新令牌（与输入同序）
 # ARGV[n+2]     = ttl_ms
+# ARGV[n+3]     = 审计保留条数
 # 成功返回 {1, fencing_1, expires_1, ..., fencing_n, expires_n}
 # 冲突返回 {0, 冲突下标_1, ...}（1 基下标，按输入顺序）
 ACQUIRE_BATCH_LUA = """
@@ -60,6 +83,7 @@ local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local n = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[n + 2])
+local maxlen = tonumber(ARGV[n + 3])
 
 local conflicts = {}
 for i = 1, n do
@@ -69,6 +93,13 @@ for i = 1, n do
   end
 end
 if #conflicts > 0 then
+  -- 仅为冲突键记录审计事件，非冲突键完全不触碰
+  for _, i in ipairs(conflicts) do
+    local fencing = tonumber(redis.call('HGET', KEYS[i], 'fencing'))
+    redis.call('XADD', KEYS[2 * n + i], 'MAXLEN', maxlen, '*',
+      'action', 'acquire_batch', 'result', 'conflict',
+      'fencing', fencing, 'time', now)
+  end
   local reply = {0}
   for _, i in ipairs(conflicts) do
     reply[#reply + 1] = i
@@ -85,6 +116,9 @@ for i = 1, n do
     'fencing', fencing,
     'expires_at', expires)
   redis.call('PEXPIRE', KEYS[i], ttl)
+  redis.call('XADD', KEYS[2 * n + i], 'MAXLEN', maxlen, '*',
+    'action', 'acquire_batch', 'result', 'acquired',
+    'fencing', fencing, 'time', now)
   reply[#reply + 1] = fencing
   reply[#reply + 1] = expires
 end
@@ -94,23 +128,35 @@ return reply
 # 续租：必须同时匹配令牌与防栅序号，且租约尚未过期。
 # 已过期的租约不允许续租（持有者必须重新申请），
 # 防止旧持有者在超时后"复活"自己的租约。
-# KEYS[1] = 租约键
-# ARGV[1] = 令牌, ARGV[2] = fencing, ARGV[3] = ttl_ms
+# 无论成功 / 失败都向审计 Stream 追加一条事件。
+# KEYS[1] = 租约键, KEYS[2] = 审计 Stream 键
+# ARGV[1] = 令牌, ARGV[2] = fencing, ARGV[3] = ttl_ms, ARGV[4] = 审计保留条数
 # 返回 {是否成功(1/0), 原因, 新 expires_at}
 RENEW_LUA = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local maxlen = tonumber(ARGV[4])
+
+local function audit(result, fencing)
+  redis.call('XADD', KEYS[2], 'MAXLEN', maxlen, '*',
+    'action', 'renew', 'result', result,
+    'fencing', fencing or '', 'time', now)
+end
 
 local token = redis.call('HGET', KEYS[1], 'token')
 if not token then
+  audit('not_found')
   return {0, 'not_found', 0}
 end
-if token ~= ARGV[1] or redis.call('HGET', KEYS[1], 'fencing') ~= ARGV[2] then
+local current = tonumber(redis.call('HGET', KEYS[1], 'fencing'))
+if token ~= ARGV[1] or current ~= tonumber(ARGV[2]) then
+  audit('conflict', current)
   return {0, 'conflict', 0}
 end
 
 local expires_at = tonumber(redis.call('HGET', KEYS[1], 'expires_at'))
 if expires_at <= now then
+  audit('expired', current)
   return {0, 'expired', 0}
 end
 
@@ -118,23 +164,39 @@ local ttl = tonumber(ARGV[3])
 local new_expires = now + ttl
 redis.call('HSET', KEYS[1], 'expires_at', new_expires)
 redis.call('PEXPIRE', KEYS[1], ttl)
+audit('renewed', current)
 return {1, 'ok', new_expires}
 """
 
 # 释放租约：令牌与防栅序号同时匹配才删除，否则静默忽略。
 # 旧持有者超时后的释放请求不会误删新持有者的租约。
-# KEYS[1] = 租约键
-# ARGV[1] = 令牌, ARGV[2] = fencing
+# 无论真正删除还是幂等忽略，都向审计 Stream 追加一条事件。
+# KEYS[1] = 租约键, KEYS[2] = 审计 Stream 键
+# ARGV[1] = 令牌, ARGV[2] = fencing, ARGV[3] = 审计保留条数
 # 返回 1（已释放）或 0（无操作）
 RELEASE_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local maxlen = tonumber(ARGV[3])
+
+local function audit(result, fencing)
+  redis.call('XADD', KEYS[2], 'MAXLEN', maxlen, '*',
+    'action', 'release', 'result', result,
+    'fencing', fencing or '', 'time', now)
+end
+
 local token = redis.call('HGET', KEYS[1], 'token')
 if not token then
+  audit('ignored')
   return 0
 end
-if token ~= ARGV[1] or redis.call('HGET', KEYS[1], 'fencing') ~= ARGV[2] then
+local current = tonumber(redis.call('HGET', KEYS[1], 'fencing'))
+if token ~= ARGV[1] or current ~= tonumber(ARGV[2]) then
+  audit('ignored', current)
   return 0
 end
 redis.call('DEL', KEYS[1])
+audit('released', current)
 return 1
 """
 

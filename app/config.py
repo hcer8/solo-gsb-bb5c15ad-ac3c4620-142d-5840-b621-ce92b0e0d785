@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     default_ttl_ms: int = Field(
         default=10_000, validation_alias="LEASE_DEFAULT_TTL_MS"
     )
+    # 每个任务键的审计 Stream 保留的最大事件条数，超出后自动裁剪最旧事件
+    audit_max_events: int = Field(
+        default=1000, ge=1, validation_alias="LEASE_AUDIT_MAX_EVENTS"
+    )
     # 限流键前缀，与租约键前缀隔离，便于多环境共用一个实例
     limit_key_prefix: str = Field(default="ratelimit", validation_alias="LIMIT_KEY_PREFIX")
     # 限流幂等记录键前缀，与限流 ZSet 键隔离

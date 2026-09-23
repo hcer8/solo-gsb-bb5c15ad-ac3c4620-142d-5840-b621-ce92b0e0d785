@@ -19,6 +19,8 @@ services:
       LEASE_MIN_TTL_MS: "100"
       LEASE_MAX_TTL_MS: "300000"
       LEASE_DEFAULT_TTL_MS: "10000"
+      # 每个任务键的审计 Stream 最多保留的事件条数，超出自动裁剪最旧事件
+      LEASE_AUDIT_MAX_EVENTS: "1000"
       LIMIT_KEY_PREFIX: "ratelimit"
       LIMIT_IDEM_KEY_PREFIX: "ratelimit-idem"
       LIMITS_MIN_WINDOW_MS: "1"

@@ -10,12 +10,17 @@
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
 重试回放不重复扣减 / 并发相同 request_id 只扣一次 / 429 结果回放 /
-request_id 跨窗口可复用 / 非法 request_id 拒绝。
+request_id 跨窗口可复用 / 非法 request_id 拒绝；以及租约审计：
+四类操作（含批量申请与失败结果）写事件 / 字段与防栅序号正确 /
+cursor+limit 分页连续不重不漏 / 非法 cursor 400 / 空任务键空列表 /
+保留条数裁剪（LEASE_AUDIT_MAX_EVENTS<=50 时）。
 """
 import json
+import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -151,6 +156,7 @@ def main():
 
     batch_checks()
     limit_checks()
+    audit_checks()
 
     print()
     if FAILED:
@@ -253,6 +259,195 @@ def batch_checks():
                    {"task_key": k1, "token": taken[k1]["token"],
                     "fencing_token": taken[k1]["fencing_token"]})
     check("batch new lease valid", code == 200 and v["valid"], f"{code} {v}")
+
+
+def audit_checks():
+    """租约审计 Stream：事件内容 / 批量事件 / cursor+limit 分页 / 裁剪。"""
+
+    def events_path(task_key, cursor=None, limit=None):
+        qs = {}
+        if cursor is not None:
+            qs["cursor"] = cursor
+        if limit is not None:
+            qs["limit"] = limit
+        query = ("?" + urllib.parse.urlencode(qs)) if qs else ""
+        return f"/v1/leases/{urllib.parse.quote(task_key, safe='')}/events{query}"
+
+    def fetch_all(task_key, page_limit=2):
+        """以小页长翻完全部事件，返回 (events, seen_ids)。"""
+        out, seen, cursor = [], set(), None
+        while True:
+            code, body = call("GET", events_path(task_key, cursor, page_limit))
+            assert code == 200, (code, body)
+            page = body["events"]
+            for e in page:
+                assert e["id"] not in seen, f"duplicate event {e['id']}"
+                seen.add(e["id"])
+            out.extend(page)
+            cursor = body["next_cursor"]
+            if cursor is None:
+                break
+        return out, seen
+
+    key = f"smoke-audit:{int(time.time() * 1000)}"
+
+    # 从无事件的任务键开始：空列表、next_cursor=null
+    code, b = call("GET", events_path(key))
+    check("audit empty task events",
+          code == 200 and b["task_key"] == key and b["events"] == []
+          and b["next_cursor"] is None, f"{code} {b}")
+
+    # acquire 成功
+    code, a = call("POST", "/v1/leases/acquire", {"task_key": key, "ttl_ms": 5000})
+    check("audit setup acquire", code == 200 and a["acquired"], f"{code} {a}")
+    token, fence = a["token"], a["fencing_token"]
+
+    # acquire 冲突
+    code, cf = call("POST", "/v1/leases/acquire", {"task_key": key, "ttl_ms": 5000})
+    check("audit setup acquire conflict", code == 409, f"{code} {cf}")
+
+    # renew 冲突（错误令牌）+ renew 成功
+    call("POST", "/v1/leases/renew",
+         {"task_key": key, "token": "wrong", "fencing_token": fence,
+          "ttl_ms": 5000})
+    call("POST", "/v1/leases/renew",
+         {"task_key": key, "token": token, "fencing_token": fence,
+          "ttl_ms": 5000})
+
+    # release 忽略（错误防栅序号）+ release 成功
+    call("POST", "/v1/leases/release",
+         {"task_key": key, "token": token, "fencing_token": fence + 99})
+    call("POST", "/v1/leases/release",
+         {"task_key": key, "token": token, "fencing_token": fence})
+
+    # renew / release 一个从不存在的键：fencing_token 为 null
+    ghost = f"{key}:ghost"
+    code, _ = call("POST", "/v1/leases/renew",
+                   {"task_key": ghost, "token": "x", "fencing_token": 1,
+                    "ttl_ms": 5000})
+    check("audit ghost renew 409", code == 409, f"code={code}")
+    code, _ = call("POST", "/v1/leases/release",
+                   {"task_key": ghost, "token": "x", "fencing_token": 1})
+    check("audit ghost release 200", code == 200, f"code={code}")
+
+    events, _ = fetch_all(key)
+    expected = [
+        ("acquire", "acquired", fence),
+        ("acquire", "conflict", fence),
+        ("renew", "conflict", fence),
+        ("renew", "renewed", fence),
+        ("release", "ignored", fence),
+        ("release", "released", fence),
+    ]
+    check("audit event sequence",
+          [(e["action"], e["result"], e["fencing_token"]) for e in events]
+          == expected, f"{[(e['action'], e['result'], e['fencing_token']) for e in events]}")
+    check("audit event times ordered & positive",
+          all(e["time_ms"] > 0 for e in events)
+          and [e["time_ms"] for e in events]
+              == sorted(e["time_ms"] for e in events)
+          and [int(e["id"].split("-")[0]) for e in events]
+              == sorted(int(e["id"].split("-")[0]) for e in events),
+          f"{[(e['id'], e['time_ms']) for e in events]}")
+
+    ghost_events, _ = fetch_all(ghost, page_limit=1)
+    check("audit ghost events null fencing",
+          [(e["action"], e["result"], e["fencing_token"]) for e in ghost_events]
+          == [("renew", "not_found", None), ("release", "ignored", None)],
+          f"{ghost_events}")
+
+    # limit 参数校验
+    code, _ = call("GET", events_path(key, limit=0))
+    check("audit limit 0 -> 422", code == 422, f"code={code}")
+    code, _ = call("GET", events_path(key, limit=201))
+    check("audit limit 201 -> 422", code == 422, f"code={code}")
+
+    # 非法 cursor -> 400
+    code, _ = call("GET", events_path(key, cursor="not-a-cursor"))
+    check("audit bad cursor -> 400", code == 400, f"code={code}")
+    code, _ = call("GET", events_path(key, cursor="12345"))
+    check("audit cursor without seq -> 400", code == 400, f"code={code}")
+
+    # 末页 next_cursor 必须为 null，且每页不超过 limit
+    code, b = call("GET", events_path(key, limit=3))
+    check("audit first page size",
+          code == 200 and len(b["events"]) == 3 and b["next_cursor"] is not None,
+          f"{code} {b}")
+
+    # 用一个不存在（但格式合法）的未来 cursor：空页
+    code, b = call("GET", events_path(key, cursor="9999999999999-0"))
+    check("audit future cursor empty",
+          code == 200 and b["events"] == [] and b["next_cursor"] is None,
+          f"{code} {b}")
+
+    # 批量申请审计：成功为每个键写 acquired；冲突仅为冲突键写 conflict
+    bbase = f"smoke-audit-batch:{int(time.time() * 1000)}"
+    bk1, bk2, bk3 = [f"{bbase}:{i}" for i in range(3)]
+    code, b = call("POST", "/v1/leases/acquire-batch",
+                   {"task_keys": [bk1, bk2], "ttl_ms": 5000})
+    check("audit batch acquire setup", code == 200 and b["acquired"], f"{code} {b}")
+    leases = {l["task_key"]: l for l in b["leases"]}
+    code, b = call("POST", "/v1/leases/acquire-batch",
+                   {"task_keys": [bk1, bk3], "ttl_ms": 5000})
+    check("audit batch conflict", code == 409 and not b["acquired"], f"{code} {b}")
+
+    # bk2 只参与第一次成功批次，恰有一条 acquired；bk1 还参与了第二次
+    # 冲突批次，其首条事件为 acquired（冲突事件在后面单独校验）
+    evs_bk2, _ = fetch_all(bk2)
+    check("audit batch success event bk2",
+          len(evs_bk2) == 1 and evs_bk2[0]["action"] == "acquire_batch"
+          and evs_bk2[0]["result"] == "acquired"
+          and evs_bk2[0]["fencing_token"] == leases[bk2]["fencing_token"],
+          f"{evs_bk2}")
+    evs_bk1, _ = fetch_all(bk1)
+    check("audit batch success event bk1 first",
+          evs_bk1[0]["action"] == "acquire_batch"
+          and evs_bk1[0]["result"] == "acquired"
+          and evs_bk1[0]["fencing_token"] == leases[bk1]["fencing_token"],
+          f"{evs_bk1}")
+    # bk1 额外有一条冲突事件（排在 acquired 之后）；bk3 不在冲突列表中，无任何事件
+    check("audit batch conflict only on conflicting key",
+          [(e["action"], e["result"]) for e in evs_bk1]
+          == [("acquire_batch", "acquired"), ("acquire_batch", "conflict")],
+          f"{evs_bk1}")
+    code, b3 = call("GET", events_path(bk3))
+    check("audit batch non-conflict key untouched",
+          code == 200 and b3["events"] == [], f"{code} {b3}")
+
+    # 任务键含 "/"（events 路由与 inspect 一致使用 path 转换器）
+    slash_key = f"{key}/sub/x"
+    code, s = call("POST", "/v1/leases/acquire",
+                   {"task_key": slash_key, "ttl_ms": 5000})
+    check("audit slash key acquire", code == 200 and s["acquired"], f"{code} {s}")
+    code, se = call("GET", events_path(slash_key))
+    check("audit slash key events",
+          code == 200 and len(se["events"]) == 1
+          and se["events"][0]["result"] == "acquired", f"{code} {se}")
+
+    # 保留条数裁剪：仅当服务端配置的保留条数较小时验证（与 compose 同一环境变量）
+    max_events = int(os.environ.get("LEASE_AUDIT_MAX_EVENTS", "1000"))
+    if max_events <= 50:
+        tkey = f"{key}:trim"
+        for i in range(max_events + 10):
+            code, _ = call("POST", "/v1/leases/acquire",
+                           {"task_key": tkey, "ttl_ms": 60_000})
+            if code == 200:
+                code, rel = call("POST", "/v1/leases/release",
+                                 {"task_key": tkey,
+                                  "token": _["token"],
+                                  "fencing_token": _["fencing_token"]})
+                assert code == 200 and rel["released"], (i, code, rel)
+            else:
+                assert code == 409, (i, code)
+        evs, _ = fetch_all(tkey, page_limit=10)
+        check("audit stream trimmed to max events",
+              len(evs) == max_events,
+              f"got {len(evs)} != {max_events}")
+        # 裁剪后仍全部是 lease 审计事件，结果取值合法
+        check("audit trimmed events intact",
+              all(e["action"] in ("acquire", "release")
+                  and e["result"] in ("acquired", "conflict", "released", "ignored")
+                  for e in evs), f"{evs[:3]}")
 
 
 def limit_checks():
