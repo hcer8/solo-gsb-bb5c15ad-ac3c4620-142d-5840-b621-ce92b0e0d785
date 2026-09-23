@@ -9,6 +9,17 @@
 - 过期判断一律使用 redis.call('TIME')，即 Redis 服务器时间，
   避免各客户端时钟不一致导致的问题。
 
+租约审计约定：
+- 每个任务键对应一个 Redis Stream（事件流键），申请（成功 / 被拒）、
+  续租、释放以及批量申请的逐任务结果都在状态转换的同一脚本内 XADD 落账，
+  与状态转换原子提交，不可能出现"操作成功但事件丢失"。
+- 条目字段：op（acquire / acquire_batch / renew / release）、
+  result（操作结果）、fencing（相关防栅序号，无则空串）、
+  time_ms（Redis 服务器毫秒，与状态判定同一时钟）、
+  batch_size（仅批量申请携带）。
+- retention > 0 时以 XADD MAXLEN 精确裁剪，每个流只保留最新的 retention 条，
+  超出部分从最旧事件开始丢弃；retention = 0 表示不限制。
+
 限流约定：
 - 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
   member 形如 "<uuid>:<cost>"，cost 编码在 member 尾部，
@@ -20,18 +31,37 @@
   服务器时间，单脚本原子执行，并发请求不会超额、不会重复扣减。
 """
 
+# 租约审计公共函数：拼接到每个需要落账的租约脚本前。
+# 条目 ID 由 XADD '*' 按 Redis 服务器时间生成（毫秒-序号），
+# 同时在字段里显式记录 time_ms，便于消费方直接读取。
+# retention > 0 时精确保留最新 retention 条（裁剪最旧事件）；= 0 不裁剪。
+_AUDIT_LUA = """
+local function audit_add(stream, retention, fields)
+  local keep = tonumber(retention)
+  if keep and keep > 0 then
+    return redis.call('XADD', stream, 'MAXLEN', keep, '*', unpack(fields))
+  end
+  return redis.call('XADD', stream, '*', unpack(fields))
+end
+"""
+
 # 申请租约：仅当租约不存在或已过期时成功。
-# KEYS[1] = 租约键, KEYS[2] = 防栅计数器键
-# ARGV[1] = 新令牌, ARGV[2] = ttl_ms
+# KEYS[1] = 租约键, KEYS[2] = 防栅计数器键, KEYS[3] = 审计事件流键
+# ARGV[1] = 新令牌, ARGV[2] = ttl_ms, ARGV[3] = 事件保留条数
 # 返回 {是否成功(1/0), fencing, expires_at}
-ACQUIRE_LUA = """
+ACQUIRE_LUA = _AUDIT_LUA + """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local ttl = tonumber(ARGV[2])
+local retention = ARGV[3]
 
 local expires_at = redis.call('HGET', KEYS[1], 'expires_at')
 if expires_at and tonumber(expires_at) > now then
-  return {0, tonumber(redis.call('HGET', KEYS[1], 'fencing')), tonumber(expires_at)}
+  local fencing = tonumber(redis.call('HGET', KEYS[1], 'fencing'))
+  audit_add(KEYS[3], retention,
+    {'op', 'acquire', 'result', 'conflict',
+     'fencing', tostring(fencing), 'time_ms', tostring(now)})
+  return {0, fencing, tonumber(expires_at)}
 end
 
 local fencing = redis.call('INCR', KEYS[2])
@@ -40,6 +70,9 @@ redis.call('HSET', KEYS[1],
   'fencing', fencing,
   'expires_at', now + ttl)
 redis.call('PEXPIRE', KEYS[1], ttl)
+audit_add(KEYS[3], retention,
+  {'op', 'acquire', 'result', 'acquired',
+   'fencing', tostring(fencing), 'time_ms', tostring(now)})
 return {1, fencing, now + ttl}
 """
 
@@ -48,18 +81,24 @@ return {1, fencing, now + ttl}
 # 不创建任何租约、不递增任何防栅计数器；
 # 全部可用（不存在或已过期，过期可被接管）时再统一写入。
 # 全程只调用一次 TIME，所有成功租约的 expires_at 基于同一基准时刻。
-# KEYS[1..n]    = 租约键
-# KEYS[n+1..2n] = 防栅计数器键（与租约键同序）
-# ARGV[1]       = 任务数 n
-# ARGV[2..n+1]  = 各任务的新令牌（与输入同序）
-# ARGV[n+2]     = ttl_ms
+# 审计事件逐任务写入各自的事件流：
+#   成功 -> 每个任务一条 acquired；冲突 -> 仅每个被占用任务一条 conflict
+#   （未冲突任务在失败批次中没有任何状态变化，与"不创建不递增"一致）。
+# KEYS[1..n]       = 租约键
+# KEYS[n+1..2n]    = 防栅计数器键（与租约键同序）
+# KEYS[2n+1..3n]   = 审计事件流键（与租约键同序）
+# ARGV[1]          = 任务数 n
+# ARGV[2..n+1]     = 各任务的新令牌（与输入同序）
+# ARGV[n+2]        = ttl_ms
+# ARGV[n+3]        = 事件保留条数
 # 成功返回 {1, fencing_1, expires_1, ..., fencing_n, expires_n}
 # 冲突返回 {0, 冲突下标_1, ...}（1 基下标，按输入顺序）
-ACQUIRE_BATCH_LUA = """
+ACQUIRE_BATCH_LUA = _AUDIT_LUA + """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local n = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[n + 2])
+local retention = ARGV[n + 3]
 
 local conflicts = {}
 for i = 1, n do
@@ -69,6 +108,13 @@ for i = 1, n do
   end
 end
 if #conflicts > 0 then
+  for _, i in ipairs(conflicts) do
+    local fencing = tonumber(redis.call('HGET', KEYS[i], 'fencing'))
+    audit_add(KEYS[2 * n + i], retention,
+      {'op', 'acquire_batch', 'result', 'conflict',
+       'fencing', tostring(fencing), 'time_ms', tostring(now),
+       'batch_size', tostring(n)})
+  end
   local reply = {0}
   for _, i in ipairs(conflicts) do
     reply[#reply + 1] = i
@@ -85,6 +131,10 @@ for i = 1, n do
     'fencing', fencing,
     'expires_at', expires)
   redis.call('PEXPIRE', KEYS[i], ttl)
+  audit_add(KEYS[2 * n + i], retention,
+    {'op', 'acquire_batch', 'result', 'acquired',
+     'fencing', tostring(fencing), 'time_ms', tostring(now),
+     'batch_size', tostring(n)})
   reply[#reply + 1] = fencing
   reply[#reply + 1] = expires
 end
@@ -94,23 +144,36 @@ return reply
 # 续租：必须同时匹配令牌与防栅序号，且租约尚未过期。
 # 已过期的租约不允许续租（持有者必须重新申请），
 # 防止旧持有者在超时后"复活"自己的租约。
-# KEYS[1] = 租约键
+# KEYS[1] = 租约键, KEYS[2] = 审计事件流键
 # ARGV[1] = 令牌, ARGV[2] = fencing, ARGV[3] = ttl_ms
+# ARGV[4] = 事件保留条数
 # 返回 {是否成功(1/0), 原因, 新 expires_at}
-RENEW_LUA = """
+RENEW_LUA = _AUDIT_LUA + """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local retention = ARGV[4]
 
 local token = redis.call('HGET', KEYS[1], 'token')
 if not token then
+  audit_add(KEYS[2], retention,
+    {'op', 'renew', 'result', 'not_found',
+     'fencing', '', 'time_ms', tostring(now)})
   return {0, 'not_found', 0}
 end
-if token ~= ARGV[1] or redis.call('HGET', KEYS[1], 'fencing') ~= ARGV[2] then
+local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
+if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
+  local f = tonumber(current_fencing)
+  audit_add(KEYS[2], retention,
+    {'op', 'renew', 'result', 'conflict',
+     'fencing', f and tostring(f) or '', 'time_ms', tostring(now)})
   return {0, 'conflict', 0}
 end
 
 local expires_at = tonumber(redis.call('HGET', KEYS[1], 'expires_at'))
 if expires_at <= now then
+  audit_add(KEYS[2], retention,
+    {'op', 'renew', 'result', 'expired',
+     'fencing', current_fencing, 'time_ms', tostring(now)})
   return {0, 'expired', 0}
 end
 
@@ -118,23 +181,41 @@ local ttl = tonumber(ARGV[3])
 local new_expires = now + ttl
 redis.call('HSET', KEYS[1], 'expires_at', new_expires)
 redis.call('PEXPIRE', KEYS[1], ttl)
+audit_add(KEYS[2], retention,
+  {'op', 'renew', 'result', 'renewed',
+   'fencing', ARGV[2], 'time_ms', tostring(now)})
 return {1, 'ok', new_expires}
 """
 
 # 释放租约：令牌与防栅序号同时匹配才删除，否则静默忽略。
 # 旧持有者超时后的释放请求不会误删新持有者的租约。
-# KEYS[1] = 租约键
-# ARGV[1] = 令牌, ARGV[2] = fencing
+# KEYS[1] = 租约键, KEYS[2] = 审计事件流键
+# ARGV[1] = 令牌, ARGV[2] = fencing, ARGV[3] = 事件保留条数
 # 返回 1（已释放）或 0（无操作）
-RELEASE_LUA = """
+RELEASE_LUA = _AUDIT_LUA + """
 local token = redis.call('HGET', KEYS[1], 'token')
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local retention = ARGV[3]
+
 if not token then
+  audit_add(KEYS[2], retention,
+    {'op', 'release', 'result', 'ignored',
+     'fencing', '', 'time_ms', tostring(now)})
   return 0
 end
-if token ~= ARGV[1] or redis.call('HGET', KEYS[1], 'fencing') ~= ARGV[2] then
+local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
+if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
+  local f = tonumber(current_fencing)
+  audit_add(KEYS[2], retention,
+    {'op', 'release', 'result', 'ignored',
+     'fencing', f and tostring(f) or '', 'time_ms', tostring(now)})
   return 0
 end
 redis.call('DEL', KEYS[1])
+audit_add(KEYS[2], retention,
+  {'op', 'release', 'result', 'released',
+   'fencing', ARGV[2], 'time_ms', tostring(now)})
 return 1
 """
 
@@ -253,4 +334,3 @@ if allowed == 1 then
 end
 return {0, remaining, reset_at, retry_after}
 """
-

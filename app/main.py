@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -31,6 +32,8 @@ from .schemas import (
     AcquiredLease,
     AcquireRequest,
     AcquireResponse,
+    LeaseEvent,
+    LeaseEventPage,
     LeaseStateResponse,
     LimitCheckRequest,
     LimitCheckResponse,
@@ -63,7 +66,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
         "原子滑动窗口成本限流（FastAPI + Redis Lua）"
@@ -99,6 +102,14 @@ def lease_key(settings: Settings, task_key: str) -> str:
 
 def fencing_key(settings: Settings, task_key: str) -> str:
     return f"{settings.key_prefix}:fencing:{task_key}"
+
+
+def event_stream_key(settings: Settings, task_key: str) -> str:
+    return f"{settings.key_prefix}:events:{task_key}"
+
+
+# Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
+_STREAM_ID_PATTERN = re.compile(r"^\d+-\d+$")
 
 
 def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
@@ -164,8 +175,12 @@ async def acquire(
     ttl = resolve_ttl(req.ttl_ms, settings)
     token = uuid.uuid4().hex
     ok, fencing, expires_at = await scripts.acquire(
-        keys=[lease_key(settings, req.task_key), fencing_key(settings, req.task_key)],
-        args=[token, ttl],
+        keys=[
+            lease_key(settings, req.task_key),
+            fencing_key(settings, req.task_key),
+            event_stream_key(settings, req.task_key),
+        ],
+        args=[token, ttl, settings.event_retention],
     )
     if ok:
         return AcquireResponse(
@@ -206,10 +221,16 @@ async def acquire_batch(
     tokens = [uuid.uuid4().hex for _ in req.task_keys]
     lease_keys = [lease_key(settings, k) for k in req.task_keys]
     fencer_keys = [fencing_key(settings, k) for k in req.task_keys]
+    event_keys = [event_stream_key(settings, k) for k in req.task_keys]
 
     result = await scripts.acquire_batch(
-        keys=lease_keys + fencer_keys,
-        args=[str(len(req.task_keys)), *tokens, str(ttl)],
+        keys=lease_keys + fencer_keys + event_keys,
+        args=[
+            str(len(req.task_keys)),
+            *tokens,
+            str(ttl),
+            settings.event_retention,
+        ],
     )
 
     if result[0]:
@@ -244,8 +265,11 @@ async def renew(
     """
     ttl = resolve_ttl(req.ttl_ms, settings)
     ok, reason, expires_at = await scripts.renew(
-        keys=[lease_key(settings, req.task_key)],
-        args=[req.token, str(req.fencing_token), ttl],
+        keys=[
+            lease_key(settings, req.task_key),
+            event_stream_key(settings, req.task_key),
+        ],
+        args=[req.token, str(req.fencing_token), ttl, settings.event_retention],
     )
     if ok:
         return RenewResponse(renewed=True, expires_at_ms=expires_at)
@@ -262,8 +286,11 @@ async def release(
     旧持有者在超时后调用本接口不会影响新租约。
     """
     released = await scripts.release(
-        keys=[lease_key(settings, req.task_key)],
-        args=[req.token, str(req.fencing_token)],
+        keys=[
+            lease_key(settings, req.task_key),
+            event_stream_key(settings, req.task_key),
+        ],
+        args=[req.token, str(req.fencing_token), settings.event_retention],
     )
     return ReleaseResponse(released=bool(released))
 
@@ -278,6 +305,75 @@ async def validate(
         args=[req.token, str(req.fencing_token)],
     )
     return ValidateResponse(valid=bool(valid), remaining_ms=remaining_ms)
+
+
+@app.get(
+    "/v1/leases/{task_key:path}/events",
+    response_model=LeaseEventPage,
+)
+async def list_events(
+    task_key: str,
+    redis: RedisDep,
+    settings: SettingsDep,
+    cursor: str | None = Query(
+        default=None,
+        description=(
+            "分页游标：上次响应返回的 next_cursor（Redis Stream 条目 ID）；"
+            "不传表示从最旧事件开始。"
+        ),
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="单页最多返回的事件条数（1～200，默认 50）",
+    ),
+) -> LeaseEventPage:
+    """读取任务键的租约审计事件（Redis Stream），按时间升序游标分页。
+
+    事件在申请（成功 / 被拒）、续租、释放与批量申请逐任务落账时，
+    与租约状态转换在同一个 Lua 脚本内原子写入，包含操作结果、
+    防栅序号与 Redis 服务器时间。每个任务键保留最新
+    `LEASE_EVENT_RETENTION` 条，超出按最旧事件裁剪。
+    """
+    if cursor is not None and not _STREAM_ID_PATTERN.match(cursor):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="cursor must be a Redis Stream entry id (<ms>-<seq>)",
+        )
+
+    # cursor 语义为"上次最后一条"，用 '(' 排除其本身，避免重复 / 漏读
+    min_id = f"({cursor}" if cursor is not None else "-"
+    raw = await redis.xrange(
+        event_stream_key(settings, task_key), min=min_id, max="+", count=limit
+    )
+
+    events = [
+        LeaseEvent(
+            id=entry_id,
+            op=fields.get("op", ""),
+            result=fields.get("result", ""),
+            fencing_token=int(fields["fencing"]) if fields.get("fencing") else None,
+            time_ms=int(fields["time_ms"]),
+            batch_size=int(fields["batch_size"]) if fields.get("batch_size") else None,
+        )
+        for entry_id, fields in raw
+    ]
+    # 本页恰好满 limit 时补一次探测，判断后面是否还有事件可翻
+    if len(events) < limit:
+        next_cursor = None
+    else:
+        probe = await redis.xrange(
+            event_stream_key(settings, task_key),
+            min=f"({events[-1].id}",
+            max="+",
+            count=1,
+        )
+        next_cursor = events[-1].id if probe else None
+
+    return LeaseEventPage(
+        task_key=task_key, events=events, next_cursor=next_cursor
+    )
 
 
 @app.get("/v1/leases/{task_key:path}", response_model=LeaseStateResponse)

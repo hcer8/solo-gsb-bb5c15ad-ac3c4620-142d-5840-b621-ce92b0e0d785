@@ -133,6 +133,43 @@ class LeaseStateResponse(BaseModel):
     remaining_ms: int = 0
 
 
+class LeaseEvent(BaseModel):
+    """单个租约审计事件。"""
+
+    id: str = Field(description="Redis Stream 条目 ID（<毫秒时间>-<序号>），即分页游标")
+    op: str = Field(
+        description="操作类型：acquire / acquire_batch / renew / release"
+    )
+    result: str = Field(
+        description=(
+            "操作结果：acquire(_batch) 为 acquired / conflict；"
+            "renew 为 renewed / not_found / conflict / expired；"
+            "release 为 released / ignored"
+        )
+    )
+    fencing_token: int | None = Field(
+        default=None, description="事件关联的防栅序号；无关联租约时为 null"
+    )
+    time_ms: int = Field(description="事件落账时刻（Redis 服务器时钟，Unix 毫秒）")
+    batch_size: int | None = Field(
+        default=None, description="仅批量申请事件携带：该批次的任务键数量"
+    )
+
+
+class LeaseEventPage(BaseModel):
+    """租约审计事件分页结果（按事件 ID 升序，即旧 -> 新）。"""
+
+    task_key: str
+    events: list[LeaseEvent]
+    next_cursor: str | None = Field(
+        default=None,
+        description=(
+            "下一页游标（本页最后一条事件 ID）；本页事件数不足 limit 或没有"
+            "更多事件时为 null。原样作为下次请求的 cursor 参数即可继续翻页。"
+        ),
+    )
+
+
 class LimitCheckRequest(BaseModel):
     client_key: str = Field(
         min_length=1,

@@ -5,6 +5,13 @@
 的防栅序号（fencing token）**。续租与释放必须同时校验令牌与防栅序号，旧持有者在
 超时后无法影响新租约；另提供校验接口，供下游判断一次操作是否仍属于当前租约。
 
+每次**申请（含成功与被拒）、续租、释放以及批量申请的逐任务结果**都会在状态转换的
+同一个 Lua 脚本内原子写入按任务键分组的 **Redis Stream 审计事件**，事件包含操作结果、
+关联防栅序号与 Redis 服务器时间；通过
+`GET /v1/leases/{task_key}/events?cursor=&limit=` 可游标分页读取（返回
+`next_cursor`），每个任务键默认保留最新 1000 条，超出按最旧事件裁剪（条数可由
+环境变量配置）。
+
 另提供 **Redis Lua 原子滑动窗口（成本）限流 API**：`POST /v1/limits/check`
 按 Redis 服务器时间累计滑动窗口内的请求成本，未超限则原子扣减并返回剩余额度，
 超限返回 `429` 与建议重试时间；同一 `client_key` 的并发请求不会超额，过期窗口
@@ -42,6 +49,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | `LEASE_MIN_TTL_MS` | `100` | 允许的最小 TTL（毫秒） |
 | `LEASE_MAX_TTL_MS` | `300000` | 允许的最大 TTL（毫秒） |
 | `LEASE_DEFAULT_TTL_MS` | `10000` | 请求未指定 `ttl_ms` 时的默认值 |
+| `LEASE_EVENT_RETENTION` | `1000` | 每个任务键的租约审计 Stream 保留的最新事件条数；超出按最旧事件裁剪。`0` 表示不限制 |
 | `LIMIT_KEY_PREFIX` | `ratelimit` | 限流 Redis 键前缀，与租约键隔离 |
 | `LIMIT_IDEM_KEY_PREFIX` | `ratelimit-idem` | 限流幂等记录 Redis 键前缀，与限流 ZSet 隔离 |
 | `LIMITS_MIN_WINDOW_MS` | `1` | 允许的最小限流窗口（毫秒） |
@@ -61,6 +69,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | POST | `/v1/leases/release` | 释放租约（幂等，始终 200） |
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
 | GET | `/v1/leases/{task_key}` | 查看任务键租约状态（不暴露令牌） |
+| GET | `/v1/leases/{task_key}/events` | 分页读取租约审计事件（`cursor` / `limit`，返回 `next_cursor`） |
 | POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减，可选 `request_id` 幂等），放行 200 / 超限 429 |
 | GET | `/healthz` | 健康检查 |
 
@@ -109,6 +118,49 @@ curl -s -X POST localhost:8000/v1/leases/release \
   -H 'Content-Type: application/json' \
   -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
 ```
+
+### 租约审计事件
+
+申请（成功 / 被占用 409）、续租、释放与批量申请都会按**任务键**向对应的
+Redis Stream 追加一条事件，与租约状态转换在同一个 Lua 脚本中原子提交。
+
+```bash
+# 读取最早的审计事件（默认每页 50 条，limit 允许 1～200）
+curl -s 'localhost:8000/v1/leases/report:daily/events?limit=20'
+# => {"task_key":"report:daily","events":[
+#   {"id":"1758000000123-0","op":"acquire","result":"acquired",
+#    "fencing_token":1,"time_ms":1758000000123,"batch_size":null},
+#   {"id":"1758000000456-0","op":"renew","result":"renewed",
+#    "fencing_token":1,"time_ms":1758000000456,"batch_size":null},
+#   {"id":"1758000000789-0","op":"release","result":"released",
+#    "fencing_token":1,"time_ms":1758000000789,"batch_size":null}
+# ],"next_cursor":"1758000000789-0"}
+
+# 用上一次返回的 next_cursor 继续翻页（游标为闭区间尾部，已自动去重）
+curl -s 'localhost:8000/v1/leases/report:daily/events?cursor=1758000000789-0&limit=20'
+# 没有更多事件时 next_cursor 为 null
+
+# 被拒 / 幂等忽略的操作同样落账（续租冲突、释放不匹配等）
+# 批量申请时每个任务键各自落一条 acquired；冲突批次仅冲突任务落 conflict，
+# 事件带 batch_size 字段（如 3）
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | Redis Stream 条目 ID（`<毫秒时间>-<序号>`），即分页游标 |
+| `op` | 操作：`acquire` / `acquire_batch` / `renew` / `release` |
+| `result` | 操作结果：`acquired` / `conflict` / `renewed` / `not_found` / `expired` / `released` / `ignored` |
+| `fencing_token` | 事件关联的防栅序号；租约不存在等无关联场景为 `null` |
+| `time_ms` | 事件落账时刻（Redis 服务器时钟，Unix 毫秒） |
+| `batch_size` | 仅批量申请事件携带：该批次任务键数量 |
+
+- 游标非法（不是 `<数字>-<数字>`）返回 `400`；`limit` 越界返回 `422`。
+- 每个任务键的流默认只保留最新 **1000** 条（精确 `MAXLEN`，从最旧事件裁剪），
+  可用 `LEASE_EVENT_RETENTION` 调整，设为 `0` 表示不限制。
+- 事件流不会过期，仅供查询；其键与租约 Hash、防栅计数器共享
+  `LEASE_KEY_PREFIX` 前缀（`:events:` 命名空间）。
 
 ### 限流示例
 
@@ -193,6 +245,15 @@ curl -i -X POST localhost:8000/v1/limits/check \
   续租（必须重新申请）。因此旧持有者在超时后的任何写操作都不会影响新租约。
 - **双重过期保障**：租约 Hash 内记录 `expires_at`（判断依据），同时设置
   `PEXPIRE`（自动清理残留键）；判断以 `expires_at` 与服务器时间的比较为准。
+- **租约审计流**：申请（成功 / 被拒）、续租、释放与批量申请的逐任务结果，均在
+  状态转换的同一个 Lua 脚本内通过 `XADD` 写入该任务键的审计 Stream——操作与
+  事件原子提交，不会出现"操作成功但事件缺失"。批量申请全败时仅被占用的冲突
+  任务各落一条 `conflict`（未冲突任务无任何状态变化，与"不创建不递增"一致）。
+  事件含操作结果、关联防栅序号、Redis 服务器时间（`time_ms`）与批次大小；
+  `XADD MAXLEN n` 在写入同时精确裁剪，每个任务键只保留最新
+  `LEASE_EVENT_RETENTION` 条（默认 1000，`0` 为不限制），超出从最旧事件丢弃。
+  查询侧以 Stream 条目 ID 为游标用 `XRANGE` 升序翻页，`next_cursor` 为
+  `null` 即没有更多事件。
 
 ### 限流设计要点
 
@@ -228,6 +289,7 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | --- | --- | --- |
 | `{prefix}:lease:{task_key}` | Hash（`token` / `fencing` / `expires_at`），带 PEXPIRE | 当前租约 |
 | `{prefix}:fencing:{task_key}` | String 计数器，无 TTL | 防栅序号，只增不减 |
+| `{prefix}:events:{task_key}` | Stream，条目含 `op` / `result` / `fencing` / `time_ms` / `batch_size`，`XADD MAXLEN` 裁剪 | 租约审计事件，按任务键分组，保留最新 `LEASE_EVENT_RETENTION` 条 |
 | `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
 | `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
 
@@ -240,7 +302,11 @@ python3 scripts/smoke_test.py            # 默认打 http://localhost:8000
 ```
 
 覆盖：获取冲突、错误令牌/序号被拒绝、防栅序号单调递增、旧持有者超时后无法
-续租/释放/干扰新租约等场景；以及限流的剩余额度递减、成本加权、超限 429
+续租/释放/干扰新租约等场景；以及批量申请的全成全败、冲突时不写不递增、
+过期接管与凭据兼容；以及租约审计流：四类操作（含被拒 / 忽略）均按任务键
+落账、事件字段（op/result/fencing/time_ms/batch_size）正确、游标分页
+（cursor + next_cursor 翻页不重不漏）、非法 cursor 返回 400 / limit
+越界返回 422、按 `LEASE_EVENT_RETENTION` 裁剪最旧事件；以及限流的剩余额度递减、成本加权、超限 429
 （含 `Retry-After` 头与不扣减语义）、窗口滑动后恢复、**20 并发恰好放行
 limit 笔不超额**、参数校验和过期数据自动清理；以及 `request_id` 幂等：
 重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
@@ -261,10 +327,10 @@ uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  config.py    # 环境变量配置（pydantic-settings）
-  lua.py       # 申请/批量申请/续租/释放/校验五个租约 Lua 脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本
-  schemas.py   # 请求 / 响应模型
-  main.py      # FastAPI 应用、路由、Redis 生命周期
+  config.py    # 环境变量配置（pydantic-settings，含审计流保留条数）
+  lua.py       # 申请/批量申请/续租/释放/校验五个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 滑动窗口限流（含 request_id 幂等）Lua 脚本
+  schemas.py   # 请求 / 响应模型（含审计事件分页模型）
+  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页）
 scripts/
   smoke_test.py
 Dockerfile
